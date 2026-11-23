@@ -131,19 +131,19 @@ class StripeDouble:
             value = json_object(raw)
             common = {'schema_version','instance_id','simulation_run_id','scenario_id','platform_account',
                       'protocol_profile','origin','api_key','public_key','admin_token','webhook_secret'}
-            if type(value.get('schema_version')) is not int or value.get('scenario_id') not in SCENARIOS:
+            schema = value.get('schema_version')
+            if type(schema) is not int or value.get('scenario_id') not in SCENARIOS:
                 raise ValueError('invalid bootstrap')
-            if value.get('schema_version') == 1:
-                if set(value) != common or value.get('protocol_profile') != API_PROFILES[LEGACY_API_VERSION]:
-                    raise ValueError('invalid bootstrap')
+            if schema == 1:
                 api_version = LEGACY_API_VERSION
-            elif value.get('schema_version') == 2:
-                if set(value) != common | {'api_version'}:
-                    raise ValueError('invalid bootstrap')
-                api_version = value['api_version']
-                if not isinstance(api_version,str) or API_PROFILES.get(api_version) != value['protocol_profile']:
-                    raise ValueError('invalid bootstrap')
+            elif schema == 2:
+                common.add('api_version')
+                api_version = value.get('api_version')
             else:
+                raise ValueError('invalid bootstrap')
+            profile = API_PROFILES.get(api_version) if isinstance(api_version,str) else None
+            if (set(value) != common or profile is None or profile.bootstrap_schema != schema
+                    or value['protocol_profile'] != profile.protocol_profile):
                 raise ValueError('invalid bootstrap')
             for field in ('instance_id','simulation_run_id'):
                 if str(uuid.UUID(value[field])) != value[field]:

@@ -1,7 +1,7 @@
 # Stripe API profiles
 
 Verified against official Stripe references on 29 October 2026. The default is
-`2026-10-28.endive`, the latest stable API version. Preview releases and arbitrary
+`2026-10-28.endive`. Preview releases and arbitrary
 version strings are unsupported. This implements the simulator's existing finite
 provider subset under that version, not the complete Stripe API.
 
@@ -57,6 +57,22 @@ Original schema-1 databases reopen as Acacia without a schema migration or any
 relabeling of stored objects and original webhook bytes. Unknown schema versions,
 unknown stored API versions, and malformed instance metadata fail closed. A
 missing HTTP Stripe-Version header never selects the default implicitly.
+
+## Adding another API version
+
+Register an `ApiProfile` in `stripe_double/wire.py` under the exact version
+string. The profile declares the bootstrap schema and protocol identifier,
+PaymentIntent form, account projections, payment balance transaction links,
+and Accounts v2 availability. The CLI, private bootstrap validator, and
+provider engine use the same registry. Use schema 2 for new profiles so the
+bootstrap carries the exact API version. Schema 1 identifies Acacia.
+
+Reuse a profile's behavior when the new version uses the same modeled
+contract. Give the entry its own protocol identifier and add tests for
+request validation, projections, webhook version, and restart. If the modeled
+contract differs, update the profile and add a focused case for the difference.
+Create a separate state file to use the new version. Existing instances keep
+their version, and unknown versions fail validation.
 
 ## Scope reviewed
 

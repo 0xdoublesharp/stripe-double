@@ -13,7 +13,7 @@ from . import __version__
 from .http_api import SimulatorServer
 from .state import StateStore
 from .webhooks import Callback
-from .wire import API_PROFILES, LEGACY_API_VERSION, SCENARIOS, SimulatorError, dumps, need
+from .wire import API_PROFILES, API_VERSION, SCENARIOS, SimulatorError, dumps, need
 
 
 def bootstrap_pipe(fd):
@@ -58,7 +58,7 @@ def serve_loopback(args, stop):
         server.start()
         host,port = server.address
         origin = f'http://[{host}]:{port}' if ':' in host else f'http://{host}:{port}'
-        bootstrap = {'schema_version':1 if store.api_version == LEGACY_API_VERSION else 2,'instance_id':store.instance_id,'simulation_run_id':run,
+        bootstrap = {'schema_version':store.profile.bootstrap_schema,'instance_id':store.instance_id,'simulation_run_id':run,
             'scenario_id':store.run(run)['scenario_id'],'platform_account':store.platform_account,
             'protocol_profile':store.protocol_profile,'origin':origin,
             'api_key':server.credentials.api_key,'public_key':server.credentials.public_key,
@@ -86,7 +86,7 @@ def main(argv=None):
     parser.add_argument('--create',action='store_true',help='explicitly create new state and a run')
     parser.add_argument('--scenario',choices=sorted(SCENARIOS))
     parser.add_argument('--api-version',choices=sorted(API_PROFILES),
-                        help='new state defaults to current stable Stripe; restart keeps the stored version')
+                        help=f'new state defaults to {API_VERSION}; restart keeps the stored version')
     parser.add_argument('--run',help='existing run UUID on restart')
     parser.add_argument('--instance',help='expected existing instance UUID on restart')
     parser.add_argument('--host',default='127.0.0.1')

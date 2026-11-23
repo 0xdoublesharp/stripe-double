@@ -1,4 +1,5 @@
 """API-version isolation, current forms and original Acacia state compatibility."""
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -8,8 +9,9 @@ import sys
 import unittest
 from unittest.mock import patch
 
+from stripe_double.harness import StripeDouble
 from stripe_double.state import StateStore
-from stripe_double.wire import API_VERSION, LEGACY_API_VERSION, SimulatorError
+from stripe_double.wire import API_PROFILES, API_VERSION, LEGACY_API_VERSION, SEPTEMBER_ENDIVE_API_VERSION, SimulatorError
 import test_http
 from test_state import FIXTURE, case_path, raw_form
 
@@ -66,6 +68,31 @@ class ProfileStateTests(unittest.TestCase):
         self.assertEqual(store.api_version, LEGACY_API_VERSION)
         self.assertEqual(store.request(run, account, "POST", "/v1/payment_intents", raw_form(form),
             key="intent").body, intent.body)
+
+    def test_added_version_uses_its_registered_behavior_and_persists_its_version(self):
+        new_version = "2099-01-01.fixture"
+        profile = replace(API_PROFILES[LEGACY_API_VERSION], protocol_profile="stripe_local_fixture_v1", bootstrap_schema=2)
+        path = case_path(self)
+        with patch.dict(API_PROFILES, {new_version:profile}):
+            store = self.store(path, create=True, api_version=new_version)
+            self.assertEqual(store.protocol_profile,profile.protocol_profile)
+            run = store.create_run("STRIPE-LOCAL-01")["simulation_run_id"]
+            account = self.account(store,run).body
+            self.assertNotIn("type",account)
+            store.scenario_action(run,"requirements_complete",store.run(run)["state_version"])
+            form = dict(FIXTURE["intent_form"])
+            intent_route = "/v1/payment_intents"
+            refused = store.request(run,account["id"],"POST",intent_route,raw_form(form),key="wrong-form")
+            self.assertEqual(refused.status,400)
+            form["payment_method_types[]"] = form.pop("allowed_payment_method_types[]")
+            created = store.request(run,account["id"],"POST",intent_route,raw_form(form),key="intent")
+            self.assertEqual(created.status,200,created.body)
+            self.assertTrue(all(json.loads(row["payload"])["api_version"] == new_version for row in store.events(run)))
+
+            store.close()
+            store = self.store(path)
+            self.assertEqual(store.api_version,new_version)
+            self.assertEqual(store.request(run,account["id"],"POST",intent_route,raw_form(form),key="intent"),created)
 
     def test_acacia_multiple_valid_captures_do_not_hit_old_per_request_cap(self):
         store = self.store(case_path(self),create=True,api_version=LEGACY_API_VERSION)
@@ -165,6 +192,22 @@ class ProfileCliTests(unittest.TestCase):
     script = ROOT
     launch = test_http.CliTests.launch
     stop = test_http.CliTests.stop
+
+    def test_harness_requires_the_registered_version_schema_and_protocol(self):
+        process, bootstrap = self.launch(case_path(self), "--create", "--scenario", "STRIPE-LOCAL-01",
+            "--api-version", SEPTEMBER_ENDIVE_API_VERSION)
+        try:
+            self.assertEqual(bootstrap["schema_version"], 2)
+            self.assertEqual(bootstrap["api_version"], SEPTEMBER_ENDIVE_API_VERSION)
+            self.assertEqual(bootstrap["protocol_profile"], "stripe_standard_us_usd_endive_202609_v1")
+            self.assertEqual(StripeDouble._validate_bootstrap(json.dumps(bootstrap).encode()), bootstrap)
+            with self.assertRaisesRegex(RuntimeError, "invalid simulator bootstrap"):
+                StripeDouble._validate_bootstrap(json.dumps({**bootstrap, "api_version":API_VERSION}).encode())
+            with self.assertRaisesRegex(RuntimeError, "invalid simulator bootstrap"):
+                StripeDouble._validate_bootstrap(json.dumps({**bootstrap, "api_version":LEGACY_API_VERSION,
+                    "protocol_profile":"stripe_standard_us_usd_test_v1"}).encode())
+        finally:
+            self.stop(process)
 
     def test_default_bootstrap_reports_current_profile_and_restart_retains_it(self):
         path = case_path(self)

@@ -140,7 +140,8 @@ class StateStore:
             need(isinstance(self.api_version, str) and self.api_version in wire.API_PROFILES,
                  503, "simulator_state")
             need(api_version is None or api_version == self.api_version, 409, "simulator_api_version")
-            self.protocol_profile = wire.API_PROFILES[self.api_version]
+            self.profile = wire.API_PROFILES[self.api_version]
+            self.protocol_profile = self.profile.protocol_profile
             self.instance_id = rows[0]["instance_id"]
             self.platform_account = rows[0]["platform_account"]
             need(str(uuid.UUID(self.instance_id)) == self.instance_id
@@ -293,8 +294,8 @@ class StateStore:
     def _public(self, run, doc):
         out = dict(doc)
         out.pop("version", None)
-        if out.get("object") == "account" and self.api_version != wire.LEGACY_API_VERSION:
-            out.setdefault("type", "standard")
+        if out.get("object") == "account" and self.profile.account_type is not None:
+            out.setdefault("type", self.profile.account_type)
         for key in list(out):
             if key.startswith("local_"):
                 out.pop(key)
@@ -413,7 +414,7 @@ class StateStore:
         need(delta >= 0,409,"simulator_conservation")
         if delta:
             transaction = self._balance_debit(run,account,refund["id"],delta,"refund",self._charge_source(charge))
-            refund["balance_transaction"] = None if self.api_version == wire.LEGACY_API_VERSION else transaction
+            refund["balance_transaction"] = transaction if self.profile.include_payment_balance_transactions else None
             refund = self._put(run,account,"refund",refund)
         charge["amount_refunded"] = total
         charge["refunded"] = total == charge["amount_captured"]
@@ -770,7 +771,7 @@ class StateStore:
             self._put(run,scope,"charge",{"id":charge,"object":"charge","livemode":False,"customer":customer,
                 "amount":amount,"amount_captured":amount,"amount_refunded":0,"captured":True,"paid":True,
                 "disputed":False,"currency":"usd","payment_intent":intent,
-                "balance_transaction":None if self.api_version == wire.LEGACY_API_VERSION else balance_tx,"created":now})
+                "balance_transaction":balance_tx if self.profile.include_payment_balance_transactions else None,"created":now})
             self._put(run,scope,"invoice_line",{"id":line,"object":"line_item","invoice":invoice,"amount":amount,
                 "pricing":{"price_details":{"price":price}},"parent":{"subscription_item_details":{}},
                 "period":{"start":now,"end":end}})
@@ -928,7 +929,7 @@ class StateStore:
         self._put(run,scope,"charge",{"id":charge,"object":"charge","livemode":False,"customer":sub["customer"],
             "amount":amount,"amount_captured":amount,"amount_refunded":0,"captured":True,"paid":True,
             "disputed":False,"currency":"usd","payment_intent":intent,
-            "balance_transaction":None if self.api_version == wire.LEGACY_API_VERSION else balance_tx,
+            "balance_transaction":balance_tx if self.profile.include_payment_balance_transactions else None,
             "application_fee":fee_id,"application_fee_amount":fee_amount,"created":now})
         if fee_id:
             fee = self._put(run,scope,"application_fee",{"id":fee_id,"object":"application_fee","livemode":False,
@@ -1013,7 +1014,7 @@ class StateStore:
             self._put(run,scope,"charge",{"id":charge,"object":"charge","livemode":False,"customer":customer,
                 "amount":amount,"amount_captured":amount,"amount_refunded":0,"captured":True,"paid":True,
                 "disputed":False,"currency":"usd","payment_intent":intent,
-                "balance_transaction":None if self.api_version == wire.LEGACY_API_VERSION else balance_tx,
+                "balance_transaction":balance_tx if self.profile.include_payment_balance_transactions else None,
                 "application_fee":fee_id,"application_fee_amount":fee_amount,"created":now})
             if fee_id:
                 fee_doc = self._put(run,scope,"application_fee",{"id":fee_id,"object":"application_fee","livemode":False,
@@ -1127,7 +1128,7 @@ class StateStore:
             "amount":doc["amount"],"amount_captured":doc["amount"],"captured":True,"paid":True,
             "currency":"usd","payment_intent":doc["id"],"payment_method_details":{"type":doc["payment_method_types"][0]},
             "application_fee":fee_id,"application_fee_amount":doc["application_fee_amount"],
-            "balance_transaction":None if self.api_version == wire.LEGACY_API_VERSION else balance_tx,
+            "balance_transaction":balance_tx if self.profile.include_payment_balance_transactions else None,
             "metadata":doc["metadata"],"created":int(self.clock())}
         if doc.get("customer"):
             charge.update(customer=doc["customer"],payment_method=doc["payment_method"])
@@ -1369,7 +1370,7 @@ class StateStore:
             return Result(200,{"object":"tax.settings","livemode":False,
                 "status":"active" if self._tax_settings(run,scope) else "pending"})
         elif kind == "account_v2_create":
-            need(self.api_version != wire.LEGACY_API_VERSION,400,"simulator_unsupported")
+            need(self.profile.supports_accounts_v2,400,"simulator_unsupported")
             need(account is None,403,"simulator_resource")
             wire.closed(form,{"identity","configuration"},{"contact_email","display_name","include"})
             identity = wire.closed(form["identity"],{"country","entity_type"})
@@ -1395,7 +1396,7 @@ class StateStore:
             self._v2_event(run,account_id,"v2.core.account.created")
             return Result(200,v2_projection(doc,include))
         elif kind == "account_v2_get":
-            need(self.api_version != wire.LEGACY_API_VERSION,400,"simulator_unsupported")
+            need(self.profile.supports_accounts_v2,400,"simulator_unsupported")
             need(account is None,403,"simulator_resource")
             doc = self._object(run,"account_v2",args[0],args[0])
             return Result(200,v2_projection(doc,list(form.values())))
@@ -1578,21 +1579,7 @@ class StateStore:
             account = self._billing_scope(run,account)
             self._account_ready(run,account)
             fields, meta = wire.metadata(form)
-            required = {"amount", "currency"}
-            optional = {"application_fee_amount", "capture_method", "customer", "setup_future_usage"}
-            if self.api_version == wire.LEGACY_API_VERSION:
-                wire.closed(fields, required | {"payment_method_types[]", "capture_method"}, optional)
-                need(fields["payment_method_types[]"] == "card")
-                method = "card"
-            else:
-                need("payment_method_types[]" not in fields and "payment_method_types" not in fields,
-                     400, "payment_method_types_no_longer_supported")
-                wire.closed(fields, required, optional | {"allowed_payment_method_types[]"})
-                # This profile models a card-only payment-method configuration.
-                # Dynamic selection therefore also resolves to card when omitted.
-                method = fields.get("allowed_payment_method_types[]", "card")
-                need(method in {"card","us_bank_account"},
-                     400, "simulator_unsupported")
+            method = wire.intent_method(fields,self.profile)
             amount = wire.integer(fields["amount"],50)
             fee = wire.integer(fields.get("application_fee_amount","0"))
             capture_method = fields.get("capture_method", "automatic")
@@ -1755,7 +1742,7 @@ class StateStore:
             source_type = self._charge_source(self._object(run,"charge",fee["charge"],fee["account"]))
             transaction = self._balance_debit(run,self.platform_account,doc["id"],amount,"application_fee_refund",source_type)
             self._balance_entry(run,fee["account"],doc["id"],amount,0,int(self.clock()),status="available",category="application_fee_refund",source_type=source_type)
-            if self.api_version != wire.LEGACY_API_VERSION:
+            if self.profile.include_payment_balance_transactions:
                 doc["balance_transaction"] = transaction
                 doc = self._put(run,fee["account"],"fee_refund",doc)
             self._event(run,fee["account"],"application_fee.refunded",fee,key)

@@ -1,5 +1,5 @@
 """Closed request/projection subset consumed by the existing adapter."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import re
 from urllib.parse import parse_qsl, urlsplit
@@ -7,10 +7,32 @@ from urllib.parse import parse_qsl, urlsplit
 API_VERSION = "2026-10-28.endive"
 LEGACY_API_VERSION = "2025-02-24.acacia"
 SEPTEMBER_ENDIVE_API_VERSION = "2026-09-30.endive"
+
+
+@dataclass(frozen=True)
+class ApiProfile:
+    protocol_profile: str
+    bootstrap_schema: int
+    payment_method_types_field: str
+    payment_method_types: frozenset[str]
+    default_payment_method: str | None
+    require_capture_method: bool
+    account_type: str | None
+    include_payment_balance_transactions: bool
+    supports_accounts_v2: bool
+
+
+_ENDIVE = ApiProfile(protocol_profile="stripe_standard_us_usd_endive_v1", bootstrap_schema=2,
+    payment_method_types_field="allowed_payment_method_types[]", payment_method_types=frozenset({"card","us_bank_account"}),
+    default_payment_method="card", require_capture_method=False, account_type="standard",
+    include_payment_balance_transactions=True, supports_accounts_v2=True)
 API_PROFILES = {
-    API_VERSION: "stripe_standard_us_usd_endive_v1",
-    LEGACY_API_VERSION: "stripe_standard_us_usd_test_v1",
-    SEPTEMBER_ENDIVE_API_VERSION: "stripe_standard_us_usd_endive_202609_v1",
+    API_VERSION: _ENDIVE,
+    LEGACY_API_VERSION: ApiProfile(protocol_profile="stripe_standard_us_usd_test_v1", bootstrap_schema=1,
+        payment_method_types_field="payment_method_types[]", payment_method_types=frozenset({"card"}),
+        default_payment_method=None, require_capture_method=True, account_type=None,
+        include_payment_balance_transactions=False, supports_accounts_v2=False),
+    SEPTEMBER_ENDIVE_API_VERSION: replace(_ENDIVE, protocol_profile="stripe_standard_us_usd_endive_202609_v1"),
 }
 MAX_BODY = 65536
 MAX_OBJECTS = 2048
@@ -123,6 +145,23 @@ def metadata(form):
         else:
             other[key] = value
     return other, result
+
+
+def intent_method(form, profile):
+    field = profile.payment_method_types_field
+    legacy_form = field == "payment_method_types[]"
+    if not legacy_form:
+        need("payment_method_types[]" not in form and "payment_method_types" not in form,
+             400, "payment_method_types_no_longer_supported")
+    required = {"amount", "currency"}
+    if profile.default_payment_method is None:
+        required.add(field)
+    if profile.require_capture_method:
+        required.add("capture_method")
+    closed(form, required, {field, "capture_method", "application_fee_amount", "customer", "setup_future_usage"})
+    method = form.get(field, profile.default_payment_method)
+    need(method in profile.payment_method_types, 400, "simulator_invalid" if legacy_form else "simulator_unsupported")
+    return method
 
 
 def session(form):
