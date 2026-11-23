@@ -32,6 +32,7 @@ ACCOUNT_FORM = {"country":"US","default_currency":"usd",
                 "controller[requirement_collection]":"stripe","controller[stripe_dashboard][type]":"full"}
 ID = re.compile(r"(?:acct|pi|ch|re|fee|fr)_LocalSim[0-9a-f]{32}\Z")
 SAVED_CARD_ID = r"pm_LocalSim[0-9a-f]{32}"
+PAYOUT_QUOTE_ID = r"pq_LocalSim[0-9a-f]{32}"
 TOKEN = re.compile(r"[\x21-\x7e]{1,255}\Z")
 
 
@@ -168,6 +169,8 @@ def route(method, target, raw):
         ("GET", r"/v1/balance_transactions/(txn_LocalSim[0-9a-f]{32})", "balance_transaction_get"),
         ("GET", r"/v1/tax/settings", "tax_settings_get"),
         ("POST", r"/v1/payouts", "payout_create"),
+        ("POST", r"/v1/payouts/instant_quotes", "payout_quote_create"),
+        ("GET", rf"/v1/payouts/instant_quotes/({PAYOUT_QUOTE_ID})", "billing_payout_quote_get"),
         ("GET", r"/v1/payouts", "billing_payout_list"),
         ("GET", r"/v1/payouts/(po_LocalSim[0-9a-f]{32})", "billing_payout_get"),
         ("POST", r"/v1/payouts/(po_LocalSim[0-9a-f]{32})/cancel", "payout_cancel"),

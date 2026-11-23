@@ -95,7 +95,8 @@ Confirmation returns HTTP 409 `simulator_payment_method_unavailable` or
 `simulator_resource` for unknown or foreign instruments.
 
 After a lost reply, read the intent with `GET /v1/payment_intents/{pi}` or
-replay the original `/v1` POST with the same key, headers, and form bytes.
+replay the original `/v1` POST with the same key, run, account, API version,
+and form bytes. Use the current bootstrap credentials after a restart.
 Replays return the stored response, including HTTP 402 outcomes, after
 restart. Reusing a key with changed input returns HTTP 409. The adapter owns
 enrollment consent, renewal scheduling, and any decision to initiate a new
@@ -146,6 +147,72 @@ original response, and stale lifecycle controls fail. No actual bank details,
 real money movement, real settlement schedules, provider processing costs, or
 application ledger are modeled. Processing fees are configurable synthetic
 fixtures, with zero processing fees by default.
+
+## Instant payout quotes and execution
+
+Use the same provider headers and form encoding as saved cards. An admin
+first configures a synthetic debit-card destination with
+`POST /__simulator/v1/runs/{run}/payout_destinations/configure`. Use the admin
+bearer and JSON `{"account":"<acct>","action":"replace","expected_state_version":1}`
+with the current run version. `replace` generates a new destination ID.
+`disable` clears it. Both return `destination` and the new `state_version`.
+An admin can fund the account with `POST /__simulator/v1/runs/{run}/balances/fund`
+and JSON `{"account":"<acct>","amount":"1000","expected_state_version":2}`,
+using the observed run version. The account must have `payouts_enabled`.
+
+1. `POST /v1/payouts/instant_quotes` with `gross=600&currency=usd` and an
+   `Idempotency-Key` returns HTTP 200. The quote includes `id`,
+   `object=local_payout_quote`, `account`, `currency`, `gross`, `fee`, `net`,
+   `destination`, `available`, `created`, `expires_at`, `payout=null`, and
+   `livemode=false`. `available` is the lesser of total and card-source
+   available funds. The quote requires enough funds but makes no reservation.
+   The synthetic fee is 1.5% of gross, rounded to the nearest cent with ties
+   rounded up and a one-cent minimum. Gross may be 2–99,999,999 cents. The
+   quote expires 300 seconds after creation.
+2. `POST /v1/payouts` with a new `Idempotency-Key`. Send `method=instant`,
+   `quote=<quote id>`, `amount=<quote net>`, and the exact quoted `currency`,
+   `gross`, `fee`, `destination`, `available`, and `expires_at`. Numeric values
+   use decimal integers with no leading zeros. `metadata[...]` is optional.
+   The quote belongs to the connected account in `Stripe-Account` and the
+   selected run. The current destination and balance version must still
+   match, including when a balance change has since been reversed.
+3. HTTP 200 returns a `pending` payout with `method=instant`, `type=card`,
+   `source_type=card`, `amount` equal to net, and the `gross`, `fee`,
+   `quote`, `destination`, and debit `balance_transaction` fields. The
+   transaction has `amount=-net`, a positive `fee`, and `net=-gross`. The
+   gross debit, quote consumption, payout, `payout.created` event, and
+   original response all commit together. `GET /v1/payouts/instant_quotes/{pq}`
+   then returns the payout ID in `payout`. After a dropped reply, use this
+   lookup or resend the exact request with its original key. The retry
+   returns the original response even after payout status changes.
+
+| HTTP | Code | Condition |
+| --- | --- | --- |
+| 403 | `simulator_resource` | Unknown or foreign quote, or platform scope |
+| 409 | `simulator_not_ready` | Payouts disabled for the account |
+| 409 | `simulator_insufficient_funds` | Gross exceeds instant availability at quote creation |
+| 409 | `simulator_payout_destination_unavailable` | No destination at quote creation |
+| 409 | `simulator_payout_quote_mismatch` | Execution terms differ from the quote |
+| 409 | `simulator_payout_quote_consumed` | A different request has already used the quote |
+| 409 | `simulator_payout_quote_expired` | Current time has reached `expires_at` |
+| 409 | `simulator_payout_destination_changed` | The destination was replaced or disabled |
+| 409 | `simulator_payout_quote_stale` | The available balance changed |
+| 409 | `simulator_idempotency` | An existing key is reused with different request bytes or API version |
+
+Use `GET /v1/payouts/{po}` or `GET /v1/payouts` to read current status.
+For lifecycle tests, get the version from
+`POST /__simulator/v1/runs/{run}/resources/inspect` with JSON
+`{"kind":"payout","resource_id":"<po>","account":"<acct>"}`. Then use
+`POST /__simulator/v1/runs/{run}/payouts/{po}/actions` with
+`{"account":"<acct>","action":"<action>","expected_provider_version":1}`,
+using the observed version. `pay` marks the payout paid and sets `arrival_date`.
+`fail` marks it failed with `failure_code=account_closed`, credits the gross
+once, and queues `payout.failed`. `POST /v1/payouts/{po}/cancel` with an empty
+form and its own idempotency key also returns the gross for pending payouts.
+The credit is linked as `failure_balance_transaction`. Read either linked
+transaction with `GET /v1/balance_transactions/{txn}`. A failed or canceled
+payout's quote stays consumed. Instant payout destinations, fees, and status
+transitions are synthetic fixtures.
 
 ## Bank payments and Accounts v2
 

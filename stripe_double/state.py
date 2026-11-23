@@ -31,6 +31,9 @@ TABLES = {"simulator_instances","scenario_runs","provider_objects","idempotency"
 MAX_BALANCE = 9007199254740991  # Largest integer exactly representable by common JSON clients.
 MAX_ACCOUNTING_OBJECTS = 16384
 ACCOUNTING_KINDS = frozenset({"balance","balance_settings","balance_transaction"})
+INSTANT_QUOTE_TTL = 300
+INSTANT_PAYOUT_FEE_BPS = 150
+INSTANT_QUOTE_TERMS = frozenset({"currency","gross","fee","destination","available","expires_at"})
 
 
 def new_id(prefix):
@@ -245,6 +248,8 @@ class StateStore:
             doc = json.loads(row["document"])
             if row["kind"] == "payout" and doc.get("status") == "pending":
                 events += 1
+                if doc.get("method") == "instant":
+                    accounting += 1  # The pending payout can still require a reversal.
             elif row["kind"] == "refund" and doc.get("status") == "pending":
                 events += 1
                 accounting += 2
@@ -508,15 +513,24 @@ class StateStore:
             self.connection.execute("UPDATE scenario_runs SET state_version=state_version+1 WHERE simulation_run_id=?",(run,))
             return {"state_version":version+1}
 
-    def _balance_entry(self,run,scope,source,amount,fee,available_on,status="pending",category="charge",source_type="card"):
+    def _payout_reservations(self,run,scope,source_type):
+        reserved = source_reserved = 0
+        for row in self.connection.execute(
+            "SELECT document FROM provider_objects WHERE simulation_run_id=? AND account_id=? AND kind='payout'",(run,scope)):
+            payout = json.loads(row[0])
+            if payout["status"] == "pending":
+                gross = payout.get("gross",payout["amount"])
+                reserved += gross
+                if payout.get("source_type","card") == source_type:
+                    source_reserved += gross
+        return reserved, source_reserved
+
+    def _balance_entry(self,run,scope,source,amount,fee,available_on,status="pending",category="charge",
+                       source_type="card",transaction_id=None):
         net = amount-fee
         balance = self._balance(run,scope)
         pending = self._pending_balance(run,scope)
-        payouts = [doc for row in self.connection.execute(
-            "SELECT document FROM provider_objects WHERE simulation_run_id=? AND account_id=? AND kind='payout'",(run,scope))
-            if (doc := json.loads(row[0]))["status"] == "pending"]
-        reserved = sum(doc["amount"] for doc in payouts)
-        source_reserved = sum(doc["amount"] for doc in payouts if doc.get("source_type","card") == source_type)
+        reserved, source_reserved = self._payout_reservations(run,scope,source_type)
         source_total = balance["local_sources"][source_type] + self._pending_balance(run,scope,source_type) + source_reserved + net
         need(-MAX_BALANCE <= balance["available"]+pending+reserved+net <= MAX_BALANCE and
              -MAX_BALANCE <= source_total <= MAX_BALANCE,429,"simulator_limit")
@@ -527,7 +541,7 @@ class StateStore:
             # Allocate the account bucket before accepting pending funds so
             # settlement never needs another accounting object.
             self._put(run,scope,"balance",balance)
-        return self._put(run,scope,"balance_transaction",{"id":new_id("txn"),"object":"balance_transaction",
+        return self._put(run,scope,"balance_transaction",{"id":transaction_id or new_id("txn"),"object":"balance_transaction",
             "livemode":False,"amount":amount,"fee":fee,"net":net,"currency":"usd","source":source,
             "type":category,"source_type":source_type,"status":status,"created":int(self.clock()),"available_on":available_on})
 
@@ -582,11 +596,7 @@ class StateStore:
             need(type(version) is int and version == row["state_version"],409,"simulator_version")
             scope = self._billing_scope(run,account)
             balance = self._balance(run,scope)
-            payouts = [doc for item in self.connection.execute(
-                "SELECT document FROM provider_objects WHERE simulation_run_id=? AND account_id=? AND kind='payout'",(run,scope))
-                if (doc := json.loads(item[0]))["status"] == "pending"]
-            reserved = sum(doc["amount"] for doc in payouts)
-            card_reserved = sum(doc["amount"] for doc in payouts if doc.get("source_type","card") == "card")
+            reserved, card_reserved = self._payout_reservations(run,scope,"card")
             need(balance["available"] + reserved + self._pending_balance(run,scope) + amount <= MAX_BALANCE and
                  balance["local_sources"]["card"] + card_reserved + self._pending_balance(run,scope,"card") + amount <= MAX_BALANCE,429,"simulator_limit")
             self._adjust_available(balance,"card",amount)
@@ -609,10 +619,84 @@ class StateStore:
             self.connection.execute("UPDATE scenario_runs SET state_version=state_version+1 WHERE simulation_run_id=?",(run,))
             return {"state_version":version+1,"rate_bps":rate}
 
+    def _payout_scope(self,run,account):
+        scope = self._billing_scope(run,account)
+        if scope != self.platform_account:
+            need(self._object(run,"account",scope,scope)["payouts_enabled"],409,"simulator_not_ready")
+        return scope
+
+    def configure_payout_destination(self,run,account,action,version):
+        need(action in {"replace","disable"},400,"simulator_unsupported")
+        with self.transaction():
+            row = self._run(run)
+            need(type(version) is int and version == row["state_version"],409,"simulator_version")
+            scope = self._billing_scope(run,account)
+            need(scope != self.platform_account,403,"simulator_resource")
+            destination = new_id("card") if action == "replace" else None
+            self._put(run,scope,"payout_destination",{"id":"dest_"+scope.removeprefix("acct_"),
+                "object":"local_payout_destination","destination":destination})
+            self.connection.execute("UPDATE scenario_runs SET state_version=state_version+1 WHERE simulation_run_id=?",(run,))
+            return {"state_version":version+1,"destination":destination}
+
+    def _payout_destination(self,run,scope):
+        row = self.connection.execute(
+            "SELECT document FROM provider_objects WHERE simulation_run_id=? AND account_id=? AND kind='payout_destination'",
+            (run,scope)).fetchone()
+        return json.loads(row[0])["destination"] if row else None
+
+    def _create_payout_quote(self,run,scope,form):
+        need(scope != self.platform_account,403,"simulator_resource")
+        wire.closed(form,{"gross","currency"})
+        need(form["currency"] == "usd",400,"simulator_unsupported")
+        gross = wire.integer(form["gross"],2)
+        fee = max(1,(gross * INSTANT_PAYOUT_FEE_BPS + 5000) // 10000)
+        destination = self._payout_destination(run,scope)
+        need(destination is not None,409,"simulator_payout_destination_unavailable")
+        balance = self._balance(run,scope)
+        available = min(balance["available"],balance["local_sources"]["card"])
+        need(gross <= available,409,"simulator_insufficient_funds")
+        now = int(self.clock())
+        return self._put(run,scope,"payout_quote",{"id":new_id("pq"),"object":"local_payout_quote","livemode":False,
+            "account":scope,"currency":"usd","gross":gross,"fee":fee,"net":gross-fee,
+            "destination":destination,"available":available,"created":now,"expires_at":now+INSTANT_QUOTE_TTL,
+            "payout":None,"local_balance_version":balance["version"]})
+
+    def _create_instant_payout(self,run,scope,fields,metadata,key):
+        need(scope != self.platform_account,403,"simulator_resource")
+        wire.closed(fields,INSTANT_QUOTE_TERMS | {"method","quote","amount"})
+        need(re.fullmatch(wire.PAYOUT_QUOTE_ID,fields["quote"]) is not None)
+        quote = self._object(run,"payout_quote",fields["quote"],scope)
+        need(quote["payout"] is None,409,"simulator_payout_quote_consumed")
+        now = int(self.clock())
+        need(now < quote["expires_at"],409,"simulator_payout_quote_expired")
+        need(fields["amount"] == str(quote["net"]) and
+             all(fields[name] == str(quote[name]) for name in INSTANT_QUOTE_TERMS),409,"simulator_payout_quote_mismatch")
+        need(self._payout_destination(run,scope) == quote["destination"],409,"simulator_payout_destination_changed")
+        balance = self._balance(run,scope)
+        available = min(balance["available"],balance["local_sources"]["card"])
+        need(balance.get("version") == quote["local_balance_version"] and quote["available"] == available
+             and quote["gross"] <= available,409,"simulator_payout_quote_stale")
+
+        # The caller's idempotent request commits the debit, quote, payout, and
+        # event with the receipt. A refusal leaves the quote untouched.
+        payout_id = new_id("po")
+        debit = self._balance_entry(run,scope,payout_id,-quote["net"],quote["fee"],now,status="available",category="payout")
+        payout = self._put(run,scope,"payout",{"id":payout_id,"object":"payout","livemode":False,
+            "amount":quote["net"],"gross":quote["gross"],"fee":quote["fee"],"currency":"usd",
+            "status":"pending","automatic":False,"method":"instant","source_type":"card","type":"card",
+            "destination":quote["destination"],"quote":quote["id"],"balance_transaction":debit["id"],
+            "arrival_date":None,"failure_code":None,"failure_balance_transaction":None,"metadata":metadata,"created":now})
+        quote["payout"] = payout_id
+        self._put(run,scope,"payout_quote",quote)
+        self._event(run,scope,"payout.created",payout,key)
+        return payout
+
     def _transition_payout(self,run,scope,payout,action,key=None):
         need(payout["status"] == "pending",409,"simulator_state")
         need(action in {"pay","fail","cancel"},400,"simulator_unsupported")
-        if action in {"fail","cancel"}:
+        releasing = action in {"fail","cancel"}
+        instant = payout.get("method") == "instant"
+        if releasing and not instant:
             balance = self._balance(run,scope)
             need(balance["available"] + payout["amount"] <= MAX_BALANCE,429,"simulator_limit")
             self._adjust_available(balance,payout.get("source_type","card"),payout["amount"])
@@ -620,7 +704,18 @@ class StateStore:
         payout["status"] = {"pay":"paid","fail":"failed","cancel":"canceled"}[action]
         if action == "fail":
             payout["failure_code"] = "account_closed"
+        if instant:
+            if releasing:
+                payout["failure_balance_transaction"] = new_id("txn")
+            else:
+                payout["arrival_date"] = int(self.clock())
         payout = self._put(run,scope,"payout",payout)
+        if instant and releasing:
+            # The transition releases the pending payout's gross and reserved
+            # accounting slot before recording its compensating credit.
+            category = "payout_failure" if action == "fail" else "payout_cancel"
+            self._balance_entry(run,scope,payout["id"],payout["gross"],0,int(self.clock()),status="available",
+                                category=category,transaction_id=payout["failure_balance_transaction"])
         self._event(run,scope,"payout." + payout["status"],payout,key)
         return payout
 
@@ -1246,6 +1341,7 @@ class StateStore:
                          "billing_price_get":"price", "billing_subscription_get":"subscription",
                          "billing_session_get":"checkout_session", "billing_invoice_get":"invoice",
                          "billing_portal_configuration_get":"portal_configuration", "billing_payout_get":"payout",
+                         "billing_payout_quote_get":"payout_quote",
                          "billing_payment_method_get":"payment_method",
                          "billing_dispute_get":"dispute", "billing_mandate_get":"mandate",
                          "billing_promotion_get":"promotion_code"}
@@ -1316,25 +1412,28 @@ class StateStore:
         elif kind == "balance_transaction_get":
             scope = self._billing_scope(run,account)
             doc = self._object(run,"balance_transaction",args[0],scope)
+        elif kind == "payout_quote_create":
+            doc = self._create_payout_quote(run,self._payout_scope(run,account),form)
         elif kind == "payout_create":
-            scope = self._billing_scope(run,account)
-            if scope != self.platform_account:
-                need(self._object(run,"account",scope,scope)["payouts_enabled"],409,"simulator_not_ready")
+            scope = self._payout_scope(run,account)
             fields, meta = wire.metadata(form)
-            wire.closed(fields,{"amount","currency"},{"method","source_type"})
-            need(fields["currency"] == "usd" and fields.get("method","standard") == "standard" and
-                 fields.get("source_type","card") in {"card","bank_account"},400,"simulator_unsupported")
-            amount = wire.integer(fields["amount"],1)
-            balance = self._balance(run,scope)
-            source_type = fields.get("source_type","card")
-            need(balance["local_sources"][source_type] >= amount and balance["available"] >= amount,409,"simulator_insufficient_funds")
-            self._adjust_available(balance,source_type,-amount)
-            self._put(run,scope,"balance",balance)
-            doc = self._put(run,scope,"payout",{"id":new_id("po"),"object":"payout","livemode":False,
-                "amount":amount,"currency":"usd","status":"pending","automatic":False,"method":"standard",
-                "source_type":source_type,"type":"bank_account","destination":None,"balance_transaction":None,
-                "arrival_date":None,"failure_code":None,"metadata":meta,"created":int(self.clock())})
-            self._event(run,scope,"payout.created",doc,key)
+            if fields.get("method") == "instant":
+                doc = self._create_instant_payout(run,scope,fields,meta,key)
+            else:
+                wire.closed(fields,{"amount","currency"},{"method","source_type"})
+                need(fields["currency"] == "usd" and fields.get("method","standard") == "standard" and
+                     fields.get("source_type","card") in {"card","bank_account"},400,"simulator_unsupported")
+                amount = wire.integer(fields["amount"],1)
+                balance = self._balance(run,scope)
+                source_type = fields.get("source_type","card")
+                need(balance["local_sources"][source_type] >= amount and balance["available"] >= amount,409,"simulator_insufficient_funds")
+                self._adjust_available(balance,source_type,-amount)
+                self._put(run,scope,"balance",balance)
+                doc = self._put(run,scope,"payout",{"id":new_id("po"),"object":"payout","livemode":False,
+                    "amount":amount,"currency":"usd","status":"pending","automatic":False,"method":"standard",
+                    "source_type":source_type,"type":"bank_account","destination":None,"balance_transaction":None,
+                    "arrival_date":None,"failure_code":None,"metadata":meta,"created":int(self.clock())})
+                self._event(run,scope,"payout.created",doc,key)
         elif kind == "payout_cancel":
             scope = self._billing_scope(run,account)
             wire.closed(form,set())

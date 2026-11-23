@@ -420,6 +420,9 @@ class SimulatorServer:
         if path == f"/__simulator/v1/runs/{run}/balances/settle":
             wire.closed(body,{"expected_state_version"},{"account"})
             return Result(200,self.store.settle_balances(run,body.get("account"),body["expected_state_version"]))
+        if path == f"/__simulator/v1/runs/{run}/payout_destinations/configure":
+            wire.closed(body,{"account","action","expected_state_version"})
+            return Result(200,self.store.configure_payout_destination(run,body["account"],body["action"],body["expected_state_version"]))
         if path == f"/__simulator/v1/runs/{run}/tax/settings/configure":
             wire.closed(body,{"rate_bps","expected_state_version"},{"account"})
             return Result(200,self.store.configure_tax(run,body.get("account"),body["rate_bps"],body["expected_state_version"]))
