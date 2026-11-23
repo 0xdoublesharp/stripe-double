@@ -237,7 +237,8 @@ class SimulatorServer:
                             result = Result(200,doc)
                         elif result.status == 200 and self.command == "GET" and self.path.startswith("/v1/payment_intents/"):
                             doc = dict(result.body)
-                            if doc.get("payment_method_types") == ["card"] and doc.get("status") in {"requires_payment_method", "requires_action", "requires_capture"}:
+                            if (doc.get("payment_method_types") == ["card"] and not doc.get("off_session")
+                                and doc.get("status") in {"requires_payment_method", "requires_action", "requires_capture"}):
                                 if account is None:
                                     account = outer.store.platform_account
                                 secret, lease = outer.capabilities.issue(run,account,"card_payment",doc["id"],doc["id"]+"_secret_")
@@ -398,7 +399,8 @@ class SimulatorServer:
         if path == f"/__simulator/v1/runs/{run}/resources/inspect":
             wire.closed(body,{"kind","resource_id"},{"account"})
             need(body["kind"] in {"account","payment_intent","charge","refund","application_fee","fee_refund",
-                                  "customer","product","price","subscription","invoice","checkout_session","payout","account_v2","dispute","mandate"})
+                                  "customer","product","price","subscription","invoice","checkout_session","payout",
+                                  "account_v2","dispute","mandate","payment_method"})
             obj = self.store.object(run,body["kind"],body["resource_id"],body.get("account"))
             version = obj.pop("version")
             return Result(200,{"provider_version":version,"object":obj})
@@ -431,6 +433,11 @@ class SimulatorServer:
             need(match[1] == run,403,"simulator_run")
             wire.closed(body,{"action","expected_provider_version"},{"account"})
             return Result(200,self.store.bank_payment_action(run,body.get("account"),match[2],body["action"],body["expected_provider_version"]))
+        match = re.fullmatch(rf"/__simulator/v1/runs/([0-9a-f-]{{36}})/payment_methods/({wire.SAVED_CARD_ID})/actions",path)
+        if match:
+            need(match[1] == run,403,"simulator_run")
+            wire.closed(body,{"account","action","expected_provider_version"})
+            return Result(200,self.store.saved_card_action(run,body["account"],match[2],body["action"],body["expected_provider_version"]))
         match = re.fullmatch(r"/__simulator/v1/runs/([0-9a-f-]{36})/charges/(ch_LocalSim[0-9a-f]{32})/disputes",path)
         if match:
             need(match[1] == run,403,"simulator_run")

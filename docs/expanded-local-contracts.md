@@ -29,6 +29,78 @@ Address and tax-ID request flags are recorded but no actual details are collecte
 or verified. Unsupported Checkout options fail closed. Production database
 and live-provider qualification are separate.
 
+## Saved cards and off-session payments
+
+Use the loopback listener, the private bootstrap API key, `Stripe-Version`,
+`X-Local-Simulator-Instance`, `X-Local-Simulator-Run`, and `Stripe-Account`
+for the connected account. Use form-encoded bodies and an `Idempotency-Key`
+on each `/v1` POST. Money amounts are integer USD cents.
+
+1. `POST /v1/customers` with `email=buyer@example.test` creates a synthetic
+   customer. `POST /v1/payment_intents` with `amount`, `currency=usd`,
+   `customer=<cus>`, and `setup_future_usage=off_session` starts an on-session
+   payment. `capture_method=automatic` is the Endive default. Set
+   `capture_method=manual` to capture separately. In Endive, omit the card
+   selection or send `allowed_payment_method_types[]=card`. In Acacia, send
+   `payment_method_types[]=card` and an explicit `capture_method`. Both intent
+   creation forms also accept `application_fee_amount` and `metadata[...]`.
+2. `GET /v1/payment_intents/{pi}` returns the initial intent's temporary
+   `client_secret`. Send JSON `{"client_secret":"<secret>","account":"<acct>","purpose":"card_payment"}`
+   to `POST /__simulator/v1/components/exchange` with the bootstrap API key and
+   the same instance, run, and version headers. Send the returned
+   `control_capability` and `provider_version` as
+   `{"control_capability":"<cap>","account":"<acct>","purpose":"card_payment","action":"confirm","expected_provider_version":1}`
+   to `POST /__simulator/v1/components/actions`, substituting the current
+   integer version. If the scenario requires authentication, use
+   `action=complete_authentication` with the new version from the confirmation.
+3. Automatic capture happens during the successful component action. For
+   manual capture, `POST /v1/payment_intents/{pi}/capture` with
+   `amount_to_capture=<full amount>`. The succeeded intent and `latest_charge`
+   carry a new `payment_method` ID. `GET /v1/payment_methods/{pm}` with the
+   bootstrap API key returns `id`, `object=payment_method`, `type=card`,
+   `customer`, `initial_payment_intent`, `status=active`, `created`, and
+   `livemode=false`. The instrument is created only during capture.
+4. For a renewal, `POST /v1/payment_intents` with `amount`, `currency=usd`,
+   and the same `customer`. Use automatic capture, with the card selection
+   for the instance's profile. This creates an intent with `off_session=true`.
+   `POST /v1/payment_intents/{pi}/confirm` with `off_session=true` and
+   `payment_method=<pm>` accepts only a saved instrument in that run, account,
+   and customer. Direct `pm_card_visa` confirmation returns HTTP 400 for both
+   setup and off-session intents. Off-session intent reads return
+   `client_secret=null`.
+
+Successful off-session confirmation returns HTTP 200 with `status=succeeded`
+and the captured charge, and queues the usual `payment_intent.succeeded`
+event. The existing admin `POST /__simulator/v1/runs/{run}/actions` accepts
+`decline_next_confirmation` or `require_authentication_next` in `action`
+with the current integer `expected_state_version`. These produce HTTP 402
+with `error.type=card_error`, `error.payment_intent`, and an `error.code` of
+`card_declined` or `authentication_required`. The intent becomes
+`requires_payment_method` or `requires_action`, respectively, with the same
+code in `last_payment_error` and no charge. An interaction-required attempt
+can be canceled with `POST /v1/payment_intents/{pi}/cancel` and an empty form.
+Any replacement payment starts on-session. `process_next_confirmation` applies
+only to on-session card confirmation.
+
+To change availability, use the admin bearer and JSON on
+`POST /__simulator/v1/runs/{run}/resources/inspect` with
+`{"kind":"payment_method","resource_id":"<pm>","account":"<acct>"}` to get
+`provider_version`. Then call
+`POST /__simulator/v1/runs/{run}/payment_methods/{pm}/actions` with
+`{"account":"<acct>","action":"<action>","expected_provider_version":1}`,
+using the observed version. `make_unavailable`, `restore`, and `revoke`
+return `status` and the new `provider_version`. Revocation is permanent.
+Confirmation returns HTTP 409 `simulator_payment_method_unavailable` or
+`simulator_payment_method_revoked` for those states, and HTTP 403
+`simulator_resource` for unknown or foreign instruments.
+
+After a lost reply, read the intent with `GET /v1/payment_intents/{pi}` or
+replay the original `/v1` POST with the same key, headers, and form bytes.
+Replays return the stored response, including HTTP 402 outcomes, after
+restart. Reusing a key with changed input returns HTTP 409. The adapter owns
+enrollment consent, renewal scheduling, and any decision to initiate a new
+attempt. All instruments and outcomes are synthetic.
+
 ## Automatic webhooks
 
 Manual delivery stays the default. When enabled with a pinned literal-loopback

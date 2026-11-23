@@ -1017,16 +1017,26 @@ class StateStore:
 
     def _capture_payment(self, run, account, doc, key=None):
         need(doc["status"] == "requires_capture",409,"simulator_state")
+        if doc.get("setup_future_usage") == "off_session":
+            # A setup intent reaches requires_capture only through the scoped
+            # card component. Save its instrument in the capture transaction.
+            saved = self._put(run,account,"payment_method",{"id":new_id("pm"),"object":"payment_method",
+                "livemode":False,"type":"card","status":"active","customer":doc["customer"],
+                "initial_payment_intent":doc["id"],"created":int(self.clock())})
+            doc["payment_method"] = saved["id"]
         charge_id = new_id("ch")
         fee_id = new_id("fee") if doc["application_fee_amount"] else None
         source_type = "bank_account" if doc["payment_method_types"] == ["us_bank_account"] else "card"
         balance_tx = self._charge_balance(run,account,charge_id,doc["amount"],doc["application_fee_amount"],fee_id,source_type)
-        charge = self._put(run,account,"charge",{"id":charge_id,"object":"charge","livemode":False,
+        charge = {"id":charge_id,"object":"charge","livemode":False,
             "amount":doc["amount"],"amount_captured":doc["amount"],"captured":True,"paid":True,
             "currency":"usd","payment_intent":doc["id"],"payment_method_details":{"type":doc["payment_method_types"][0]},
             "application_fee":fee_id,"application_fee_amount":doc["application_fee_amount"],
             "balance_transaction":None if self.api_version == wire.LEGACY_API_VERSION else balance_tx,
-            "metadata":doc["metadata"],"created":int(self.clock())})
+            "metadata":doc["metadata"],"created":int(self.clock())}
+        if doc.get("customer"):
+            charge.update(customer=doc["customer"],payment_method=doc["payment_method"])
+        self._put(run,account,"charge",charge)
         if fee_id:
             fee = self._put(run,account,"application_fee",{"id":fee_id,"object":"application_fee","livemode":False,
                 "account":account,"charge":charge_id,"amount":doc["application_fee_amount"],"currency":"usd",
@@ -1036,6 +1046,22 @@ class StateStore:
         doc = self._put(run,account,"payment_intent",doc)
         self._event(run,account,"payment_intent.succeeded",doc,key)
         return doc
+
+    def saved_card_action(self,run,account,method_id,action,version):
+        transitions = {"make_unavailable":({"active"},"unavailable"),
+                       "restore":({"unavailable"},"active"),
+                       "revoke":({"active","unavailable"},"revoked")}
+        need(action in transitions,400,"simulator_unsupported")
+        allowed, status = transitions[action]
+        with self.transaction():
+            self._run(run)
+            scope = self._billing_scope(run,account)
+            method = self._object(run,"payment_method",method_id,scope)
+            need(type(version) is int and version == method["version"],409,"simulator_version")
+            need(method["status"] in allowed,409,"simulator_state")
+            method["status"] = status
+            method = self._put(run,scope,"payment_method",method)
+            return {"provider_version":method["version"],"status":method["status"]}
 
     def bank_payment_action(self,run,account,intent_id,action,version):
         need(action in {"succeed","fail"},400,"simulator_unsupported")
@@ -1115,6 +1141,8 @@ class StateStore:
             need(doc["status"] == "requires_payment_method",409,"simulator_state")
             outcome = ("declined" if action == "decline" or state.get("decline_next")
                        else state.get("next_confirmation", "requires_capture"))
+            off_session = doc.get("off_session",False)
+            need(not off_session or outcome != "processing",400,"simulator_unsupported")
             if state.get("decline_next") or state.get("next_confirmation"):
                 state["decline_next"] = False
                 state.pop("next_confirmation", None)
@@ -1122,7 +1150,10 @@ class StateStore:
             doc["status"] = "requires_payment_method" if outcome == "declined" else outcome
             doc["last_payment_error"] = {"type":"card_error","code":"card_declined"} if outcome == "declined" else None
             if outcome == "requires_action":
-                doc["next_action"] = {"type":"use_stripe_sdk"}
+                if off_session:
+                    doc["last_payment_error"] = {"type":"card_error","code":"authentication_required"}
+                else:
+                    doc["next_action"] = {"type":"use_stripe_sdk"}
             event = {"declined":"payment_intent.payment_failed", "requires_action":"payment_intent.requires_action",
                      "processing":"payment_intent.processing", "requires_capture":"payment_intent.amount_capturable_updated"}[outcome]
         else:
@@ -1158,6 +1189,7 @@ class StateStore:
                 doc = self._put(run,account,"account",doc)
                 self._event(run,account,"account.updated",doc)
             else:
+                need(not doc.get("off_session"),409,"simulator_state")
                 doc = self._advance_payment(run,account,doc,action)
             return {"provider_version":doc["version"],"closed":False}
 
@@ -1214,6 +1246,7 @@ class StateStore:
                          "billing_price_get":"price", "billing_subscription_get":"subscription",
                          "billing_session_get":"checkout_session", "billing_invoice_get":"invoice",
                          "billing_portal_configuration_get":"portal_configuration", "billing_payout_get":"payout",
+                         "billing_payment_method_get":"payment_method",
                          "billing_dispute_get":"dispute", "billing_mandate_get":"mandate",
                          "billing_promotion_get":"promotion_code"}
             list_kinds = {"billing_subscription_list":"subscription", "billing_invoice_list":"invoice",
@@ -1447,9 +1480,9 @@ class StateStore:
             self._account_ready(run,account)
             fields, meta = wire.metadata(form)
             required = {"amount", "currency"}
-            optional = {"application_fee_amount", "capture_method"}
+            optional = {"application_fee_amount", "capture_method", "customer", "setup_future_usage"}
             if self.api_version == wire.LEGACY_API_VERSION:
-                wire.closed(fields, required | {"payment_method_types[]", "capture_method"}, {"application_fee_amount"})
+                wire.closed(fields, required | {"payment_method_types[]", "capture_method"}, optional)
                 need(fields["payment_method_types[]"] == "card")
                 method = "card"
             else:
@@ -1467,10 +1500,21 @@ class StateStore:
             need(fields["currency"] == "usd" and capture_method in {"manual", "automatic"} and fee < amount)
             need(method == "card" or capture_method == "automatic",400,"simulator_unsupported")
             need(account != self.platform_account or fee == 0,400,"simulator_unsupported")
+            card_fields = {}
+            if "customer" in fields or "setup_future_usage" in fields:
+                need(account != self.platform_account and method == "card" and "customer" in fields,400,"simulator_unsupported")
+                customer = self._object(run,"customer",fields["customer"],account)
+                card_fields.update(customer=customer["id"],payment_method=None)
+                if "setup_future_usage" in fields:
+                    need(fields["setup_future_usage"] == "off_session",400,"simulator_unsupported")
+                    card_fields["setup_future_usage"] = "off_session"
+                else:
+                    need(capture_method == "automatic",400,"simulator_unsupported")
+                    card_fields["off_session"] = True
             doc = self._put(run,account,"payment_intent",{"id":new_id("pi"),"object":"payment_intent","livemode":False,
                 "amount":amount,"amount_received":0,"currency":"usd","capture_method":capture_method,"payment_method_types":[method],
                 "application_fee_amount":fee,"metadata":meta,"status":"requires_payment_method","latest_charge":None,
-                "last_payment_error":None,"created":int(self.clock())})
+                "last_payment_error":None,"created":int(self.clock()),**card_fields})
             self._event(run,account,"payment_intent.created",doc,key)
         elif kind == "intent_get":
             scope = self._billing_scope(run,account)
@@ -1479,7 +1523,8 @@ class StateStore:
             account = self._billing_scope(run,account)
             doc = self._object(run,"payment_intent",args[0],account)
             if args[1] == "confirm":
-                wire.closed(form,{"payment_method"})
+                off_session = doc.get("off_session",False)
+                wire.closed(form,{"payment_method","off_session"} if off_session else {"payment_method"})
                 if doc["payment_method_types"] == ["us_bank_account"]:
                     need(form["payment_method"] in {"pm_usBankAccount_processing","pm_usBankAccount_unverified"},400,"simulator_unsupported")
                     self._account_ready(run,account)
@@ -1497,12 +1542,21 @@ class StateStore:
                     doc = self._put(run,account,"payment_intent",doc)
                     self._event(run,account,"payment_intent.requires_action" if unverified else "payment_intent.processing",doc,key)
                     return Result(200,self._public(run,doc))
-                need(form["payment_method"] == "pm_card_visa",400,"simulator_unsupported")
-                doc["payment_method"] = "pm_card_visa"
+                payment_method = form["payment_method"]
+                if off_session:
+                    need(form["off_session"] == "true" and re.fullmatch(wire.SAVED_CARD_ID,payment_method),400,"simulator_unsupported")
+                    saved = self._object(run,"payment_method",payment_method,account)
+                    need(saved["customer"] == doc["customer"],403,"simulator_resource")
+                    need(saved["status"] != "revoked",409,"simulator_payment_method_revoked")
+                    need(saved["status"] == "active",409,"simulator_payment_method_unavailable")
+                else:
+                    need(not doc.get("setup_future_usage") and payment_method == "pm_card_visa",400,"simulator_unsupported")
+                doc["payment_method"] = payment_method
                 doc = self._advance_payment(run,account,doc,"confirm",key)
-                if doc["status"] == "requires_payment_method":
-                    return Result(402,{"error":{"type":"card_error","code":"card_declined",
-                        "message":"The simulated card was declined.","payment_intent":self._public(run,doc)}})
+                if error := doc.get("last_payment_error"):
+                    message = ("The simulated card requires authentication." if error["code"] == "authentication_required"
+                               else "The simulated card was declined.")
+                    return Result(402,{"error":{**error,"message":message,"payment_intent":self._public(run,doc)}})
                 return Result(200,self._public(run,doc))
             if args[1] == "capture":
                 self._account_ready(run,account)
@@ -1515,6 +1569,8 @@ class StateStore:
                 allowed = {"requires_payment_method","requires_capture"}
                 if doc["payment_method_types"] == ["us_bank_account"]:
                     allowed |= {"requires_action","processing"}
+                if doc.get("off_session"):
+                    allowed.add("requires_action")
                 need(doc["status"] in allowed,409,"simulator_state")
                 doc["status"] = "canceled"
                 doc = self._put(run,account,"payment_intent",doc)

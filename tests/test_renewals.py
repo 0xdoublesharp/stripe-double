@@ -1,8 +1,11 @@
-"""Explicit, version-checked subscription renewal and promotion scenarios."""
+"""Synthetic subscription renewals and scoped saved-card captures."""
 from datetime import datetime, timezone
+import http.client
+import json
 import unittest
 from unittest.mock import patch
 import test_near_term
+from stripe_double.state import new_id
 
 
 class RenewalTests(unittest.TestCase):
@@ -129,3 +132,158 @@ class RenewalTests(unittest.TestCase):
         status, recovered, _ = self.action(seed['subscription'],'retry_renewal',failed['provider_version'])
         self.assertEqual(status,200,recovered)
         self.assertEqual(recovered['status'],'active')
+
+
+class SavedCardTests(unittest.TestCase):
+    setUp = test_near_term.NearTermHttpTests.setUp
+    close = test_near_term.NearTermHttpTests.close
+    request = test_near_term.NearTermHttpTests.request
+    control = test_near_term.NearTermHttpTests.control
+    account = test_near_term.NearTermHttpTests.account
+    ready = test_near_term.NearTermHttpTests.ready
+    exchange = test_near_term.NearTermHttpTests.exchange
+    component = test_near_term.NearTermHttpTests.component
+    grant = test_near_term.NearTermHttpTests.grant
+    admin = test_near_term.NearTermHttpTests.admin
+    restart = test_near_term.test_http.HttpTests.restart
+
+    def customer(self, account, key='customer'):
+        status, customer, _ = self.request('POST','/v1/customers',{'email':'buyer@example.test'},
+                                           account=account,key=key)
+        self.assertEqual(status,200,customer)
+        return customer['id']
+
+    def intent(self, account, customer, key, **options):
+        status, intent, _ = self.request('POST','/v1/payment_intents',
+            {'amount':'1000','currency':'usd','customer':customer,**options},account=account,key=key)
+        self.assertEqual(status,200,intent)
+        return '/v1/payment_intents/' + intent['id']
+
+    def saved_card(self, account, customer):
+        initial = self.intent(account,customer,'initial',setup_future_usage='off_session')
+        grant = self.grant(account,initial.rsplit('/',1)[1])
+        status, result, _ = self.component(grant['control_capability'],account,'card_payment',
+                                            'confirm',grant['provider_version'])
+        self.assertEqual(status,200,result)
+        return self.request('GET',initial,account=account)[1]['payment_method']
+
+    def confirm(self, route, account, method, key, **options):
+        return self.request('POST',route + '/confirm',{'payment_method':method,**options},
+                            account=account,key=key)
+
+    def test_saved_card_requires_scoped_component_confirmation_and_capture(self):
+        owner, foreign = self.account(), self.account('foreign')
+        self.ready()
+        customer = self.customer(owner)
+        initial = self.intent(owner,customer,'initial',setup_future_usage='off_session',capture_method='manual')
+        capture_form = {'amount_to_capture':'1000'}
+        self.assertEqual(self.confirm(initial,owner,'pm_card_visa','shortcut')[0],400)
+        self.assertEqual(self.request('POST',initial + '/capture',capture_form,account=owner,key='uncaptured')[0],409)
+        status, observed, _ = self.request('GET',initial,account=owner)
+        self.assertEqual(status,200,observed)
+        self.assertEqual(self.request('GET',initial,account=foreign)[0],403)
+        self.assertEqual(self.exchange(observed['client_secret'],foreign,'card_payment')[0],403)
+        self.assertEqual(self.admin('require_authentication_next')[0],200)
+        status, grant, _ = self.exchange(observed['client_secret'],owner,'card_payment')
+        self.assertEqual(status,200,grant)
+        capability = grant['control_capability']
+        self.assertEqual(self.component(capability,foreign,'card_payment','confirm',grant['provider_version'])[0],403)
+        status, changed, _ = self.component(capability,owner,'card_payment','confirm',grant['provider_version'])
+        self.assertEqual(status,200,changed)
+        self.assertEqual(self.request('GET',initial,account=owner)[1]['status'],'requires_action')
+        self.assertEqual(self.request('POST',initial + '/capture',capture_form,account=owner,key='before-auth')[0],409)
+        self.assertEqual(self.store.objects(self.run,'payment_method'),[])
+        self.assertEqual(self.component(capability,owner,'card_payment','complete_authentication',changed['provider_version'])[0],200)
+        self.assertEqual(self.store.objects(self.run,'payment_method'),[])
+
+        self.assertEqual(self.admin('drop_next_reply_after_commit')[0],200)
+        with self.assertRaises((http.client.RemoteDisconnected,ConnectionResetError)):
+            self.request('POST',initial + '/capture',capture_form,account=owner,key='capture')
+        self.restart()
+        status, captured, _ = self.request('POST',initial + '/capture',capture_form,account=owner,key='capture')
+        self.assertEqual(status,200,captured)
+        self.assertEqual(captured['status'],'succeeded')
+        saved = captured['payment_method']
+        self.assertEqual(captured['latest_charge']['payment_method'],saved)
+        self.assertEqual(self.request('GET',initial,account=owner)[1]['payment_method'],saved)
+        method_path = '/v1/payment_methods/' + saved
+        status, method, _ = self.request('GET',method_path,account=owner)
+        self.assertEqual(status,200,method)
+        self.assertEqual((method['customer'],method['type'],method['status']),(customer,'card','active'))
+        self.assertEqual(method['initial_payment_intent'],captured['id'])
+        self.assertEqual(self.request('GET',method_path,account=foreign)[0],403)
+        self.assertEqual(len(self.store.objects(self.run,'payment_method')),1)
+        self.assertEqual(len(self.store.objects(self.run,'charge')),1)
+
+    def test_off_session_confirmation_is_scoped_and_recoverable_after_lost_reply(self):
+        owner, foreign = self.account(), self.account('foreign')
+        self.ready()
+        customer = self.customer(owner)
+        method = self.saved_card(owner,customer)
+        renewal = self.intent(owner,customer,'renewal',application_fee_amount='100')
+        other_customer = self.intent(owner,self.customer(owner,'second-customer'),'other-customer')
+        other_account = self.intent(foreign,self.customer(foreign),'other-account')
+        self.assertIsNone(self.request('GET',renewal,account=owner)[1]['client_secret'])
+        self.assertEqual(self.confirm(renewal,owner,'pm_card_visa','direct')[0],400)
+        self.assertEqual(self.confirm(renewal,owner,'pm_card_visa','universal',off_session='true')[0],400)
+        self.assertEqual(self.confirm(renewal,owner,method,'missing-flag')[0],400)
+        self.assertEqual(self.confirm(other_customer,owner,method,'wrong-buyer',off_session='true')[0],403)
+        self.assertEqual(self.confirm(other_account,foreign,method,'wrong-account',off_session='true')[0],403)
+        self.assertEqual(self.confirm(renewal,owner,new_id('pm'),'missing',off_session='true')[0],403)
+
+        self.assertEqual(self.admin('drop_next_reply_after_commit')[0],200)
+        with self.assertRaises((http.client.RemoteDisconnected,ConnectionResetError)):
+            self.confirm(renewal,owner,method,'confirm',off_session='true')
+        self.restart()
+        status, captured, _ = self.confirm(renewal,owner,method,'confirm',off_session='true')
+        self.assertEqual(status,200,captured)
+        self.assertEqual((captured['status'],captured['customer'],captured['payment_method']),('succeeded',customer,method))
+        self.assertEqual(captured['latest_charge']['application_fee_amount'],100)
+        self.assertEqual(self.request('GET',renewal,account=owner)[1]['latest_charge'],captured['latest_charge'])
+        self.assertEqual(self.confirm(renewal,owner,new_id('pm'),'confirm',off_session='true')[0],409)
+        self.assertEqual(self.confirm(renewal,owner,method,'second-confirm',off_session='true')[0],409)
+        self.assertEqual(self.request('GET','/v1/charges?payment_intent=' + captured['id'],account=owner)[1]['data'],
+                         [captured['latest_charge']])
+        self.assertEqual(len(self.store.objects(self.run,'payment_method')),1)
+        events = [json.loads(row['payload']) for row in self.store.events(self.run)]
+        self.assertEqual(sum(e['type'] == 'payment_intent.succeeded' and e['request']['idempotency_key'] == 'confirm'
+                             for e in events),1)
+
+    def test_unavailable_revoked_declined_and_interaction_required(self):
+        account = self.account()
+        self.ready()
+        customer = self.customer(account)
+        method = self.saved_card(account,customer)
+        renewal = self.intent(account,customer,'renewal')
+
+        def change(action):
+            info = self.control('resources/inspect',{'kind':'payment_method','resource_id':method,'account':account})[1]
+            request = {'action':action,'account':account,'expected_provider_version':info['provider_version']}
+            endpoint = 'payment_methods/' + method + '/actions'
+            self.assertEqual(self.control(endpoint,request,token=self.server.credentials.api_key)[0],403)
+            status, result, _ = self.control(endpoint,request)
+            self.assertEqual(status,200,result)
+            self.assertEqual(self.control(endpoint,request)[0],409)
+
+        change('make_unavailable')
+        status, error, _ = self.confirm(renewal,account,method,'unavailable',off_session='true')
+        self.assertEqual((status,error['error']['code']),(409,'simulator_payment_method_unavailable'))
+        change('restore')
+        for trigger, code, expected in [('decline_next_confirmation','card_declined','requires_payment_method'),
+                                        ('require_authentication_next','authentication_required','requires_action')]:
+            with self.subTest(trigger=trigger):
+                self.assertEqual(self.admin(trigger)[0],200)
+                status, error, _ = self.confirm(renewal,account,method,trigger,off_session='true')
+                self.assertEqual(status,402,error)
+                self.assertEqual(error['error']['code'],code)
+                self.assertEqual(error['error']['payment_intent']['status'],expected)
+                self.assertEqual(self.confirm(renewal,account,method,trigger,off_session='true')[:2],(status,error))
+                observed = self.request('GET',renewal,account=account)[1]
+                self.assertEqual((observed['status'],observed['last_payment_error']['code']),(expected,code))
+                self.assertIsNone(observed['latest_charge'])
+                self.assertIsNone(observed['client_secret'])
+        change('revoke')
+        another = self.intent(account,customer,'after-revocation')
+        status, error, _ = self.confirm(another,account,method,'revoked',off_session='true')
+        self.assertEqual((status,error['error']['code']),(409,'simulator_payment_method_revoked'))
+        self.assertEqual(len(self.store.objects(self.run,'charge')),1)

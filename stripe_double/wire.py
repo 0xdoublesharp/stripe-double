@@ -31,6 +31,7 @@ ACCOUNT_FORM = {"country":"US","default_currency":"usd",
                 "controller[losses][payments]":"stripe","controller[fees][payer]":"account",
                 "controller[requirement_collection]":"stripe","controller[stripe_dashboard][type]":"full"}
 ID = re.compile(r"(?:acct|pi|ch|re|fee|fr)_LocalSim[0-9a-f]{32}\Z")
+SAVED_CARD_ID = r"pm_LocalSim[0-9a-f]{32}"
 TOKEN = re.compile(r"[\x21-\x7e]{1,255}\Z")
 
 
@@ -192,6 +193,7 @@ def route(method, target, raw):
         ("POST", r"/v1/payment_intents", "intent_create"),
         ("GET", r"/v1/payment_intents/(pi_LocalSim[0-9a-f]{32})", "intent_get"),
         ("POST", r"/v1/payment_intents/(pi_LocalSim[0-9a-f]{32})/(capture|cancel|confirm)", "intent_action"),
+        ("GET", rf"/v1/payment_methods/({SAVED_CARD_ID})", "billing_payment_method_get"),
         ("POST", r"/v1/payment_intents/(pi_LocalSim[0-9a-f]{32})/verify_microdeposits", "bank_verify"),
         ("GET", r"/v1/charges/(ch_LocalSim[0-9a-f]{32})", "charge_get"),
         ("POST", r"/v1/refunds", "refund_create"),
