@@ -3,6 +3,7 @@ import json
 import unittest
 from unittest.mock import patch
 import test_near_term
+from stripe_double.state import new_id
 
 
 class PayoutTests(unittest.TestCase):
@@ -14,6 +15,43 @@ class PayoutTests(unittest.TestCase):
     admin = test_near_term.NearTermHttpTests.admin
     ready = test_near_term.NearTermHttpTests.ready
     restart = test_near_term.test_http.HttpTests.restart
+
+    def test_standard_account_exposes_schedule_without_account_write(self):
+        account = self.account()
+        path = '/v1/accounts/' + account
+        status, profile, _ = self.request('GET', path)
+        self.assertEqual(status, 200)
+        self.assertEqual(profile.get('settings', {}).get('payouts', {}).get('schedule'),
+                         {'interval':'daily','delay_days':2})
+        self.assertEqual(self.request('POST', path,
+            {'settings[payouts][schedule][interval]':'manual'}, key='schedule')[0], 400)
+
+    def test_filter_reconciled_transactions_by_connected_payout(self):
+        account, other = self.account('owner'), self.account('foreign')
+        payout = new_id('po')
+        charge = new_id('ch')
+        payment = new_id('py')
+        with self.store.transaction():
+            self.store._put(self.run, account, 'payout', {'id':payout,'object':'payout',
+                'amount':500,'created':10,'automatic':True,'reconciliation_status':'completed'})
+            for owner, kind, source, related in [(account,'charge',charge,True),
+                (account,'payment',payment,True), (other,'charge',new_id('ch'),True),
+                (account,'charge',new_id('ch'),False)]:
+                txn = {'id':new_id('txn'),'object':'balance_transaction','created':10,
+                       'type':kind,'source':source}
+                if related:
+                    txn['local_automatic_payout'] = payout
+                self.store._put(self.run, owner, 'balance_transaction', txn)
+        route = '/v1/balance_transactions?payout=' + payout + '&limit=1'
+        status, first, _ = self.request('GET', route, account=account)
+        self.assertEqual(status, 200)
+        self.assertTrue(first['has_more'])
+        status, last, _ = self.request('GET', route+'&starting_after='+first['data'][0]['id'], account=account)
+        self.assertEqual(status, 200)
+        self.assertFalse(last['has_more'])
+        self.assertEqual({t['source'] for t in first['data']+last['data']}, {charge,payment})
+        self.assertTrue(all('local_automatic_payout' not in t for t in first['data']+last['data']))
+        self.assertEqual(self.request('GET', route, account=other)[0], 403)
 
     def fund(self, account, amount):
         return self.control('balances/fund', {'account':account,'amount':str(amount),

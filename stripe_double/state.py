@@ -943,6 +943,13 @@ class StateStore:
         objects = [json.loads(row[0]) for row in self.connection.execute(
             "SELECT document FROM provider_objects WHERE simulation_run_id=? AND account_id=? AND kind=? ORDER BY object_id",
             (run,scope,kind))]
+        if kind in {"payout","balance_transaction"}:
+            objects.sort(key=lambda obj: (obj["created"],obj["id"]),reverse=True)
+        if kind == "balance_transaction":
+            payout = self._object(run,"payout",query["payout"],scope)
+            need(payout.get("automatic") and payout.get("reconciliation_status") == "completed",
+                 400,"simulator_unsupported")
+            objects = [obj for obj in objects if obj.get("local_automatic_payout") == payout["id"]]
         if invoice is not None:
             self._object(run,"invoice",invoice,scope)
             objects = [obj for obj in objects if obj.get("invoice") == invoice]
@@ -1270,6 +1277,9 @@ class StateStore:
             return Result(200,{"object":"balance","livemode":False,
                 "available":[{"amount":balance["available"],"currency":"usd","source_types":dict(balance["local_sources"])}],
                 "pending":[{"amount":sum(pending.values()),"currency":"usd","source_types":pending}]})
+        elif kind == "balance_transaction_list":
+            scope = self._billing_scope(run,account)
+            return Result(200,self._billing_list(run,scope,"balance_transaction",form,"/v1/balance_transactions"))
         elif kind == "balance_transaction_get":
             scope = self._billing_scope(run,account)
             doc = self._object(run,"balance_transaction",args[0],scope)
@@ -1425,6 +1435,7 @@ class StateStore:
         elif kind == "account_get":
             need(account is None,403,"simulator_resource")
             doc = self._object(run,"account",args[0],args[0])
+            doc.setdefault("settings",{"payouts":{"schedule":{"interval":"daily","delay_days":2}}})
         elif kind == "session":
             need(account is None,403,"simulator_resource")
             purpose, components = wire.session(form)

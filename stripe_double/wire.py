@@ -163,6 +163,7 @@ def route(method, target, raw):
         ("GET", r"/v1/billing_portal/configurations", "billing_portal_configuration_list"),
         ("GET", r"/v1/billing_portal/configurations/(bpc_LocalSim[0-9a-f]{32})", "billing_portal_configuration_get"),
         ("GET", r"/v1/balance", "balance_get"),
+        ("GET", r"/v1/balance_transactions", "balance_transaction_list"),
         ("GET", r"/v1/balance_transactions/(txn_LocalSim[0-9a-f]{32})", "balance_transaction_get"),
         ("GET", r"/v1/tax/settings", "tax_settings_get"),
         ("POST", r"/v1/payouts", "payout_create"),
@@ -222,7 +223,10 @@ def route(method, target, raw):
         "billing_payout_list":{"status","limit","starting_after"},
         "billing_promotion_list":{"active","code","limit","starting_after"},
     }
-    if kind == "account_v2_get":
+    if kind == "balance_transaction_list":
+        closed(query,{"payout"},{"limit","starting_after"})
+        need(re.fullmatch(r"po_LocalSim[0-9a-f]{32}",query["payout"]) is not None)
+    elif kind == "account_v2_get":
         need(all(re.fullmatch(r"include\[[0-9]+\]",key) for key in query))
         indexes = sorted(int(key[8:-1]) for key in query)
         need(indexes == list(range(len(indexes))) and len(indexes) <= 3)
